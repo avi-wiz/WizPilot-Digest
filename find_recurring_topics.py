@@ -16,7 +16,7 @@ number to put in a dashboard.
 Run:
   export REDASH_URL=... REDASH_API_KEY=...
   export Q_QUESTIONS=<questions_sample_wizjoin query id>
-  export LLM_BASE_URL=... LLM_API_KEY=... LLM_MODEL=grok-4
+  export ANTHROPIC_API_KEY=...          # or LLM_BASE_URL+LLM_API_KEY — see llm_client.py
   python3 find_recurring_topics.py --start 2026-08-13 --end 2026-08-19
 """
 from __future__ import annotations
@@ -24,11 +24,11 @@ import argparse
 import json
 import os
 import sys
-import urllib.request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 from redash_client import Redash, RedashError  # noqa: E402
+import llm_client  # noqa: E402
 # NOTE: poc_digest imports `cluster` from this module (for the weekly digest
 # section), so importing poc_digest back at module level here would be
 # circular. The main()-only CLI path below needs load_dotenv/_env/_qid from
@@ -53,26 +53,11 @@ SYSTEM = (
 
 
 def cluster(questions: list[str]) -> dict:
-    base_url, key = os.environ.get("LLM_BASE_URL"), os.environ.get("LLM_API_KEY")
-    if not base_url or not key:
-        sys.exit("Missing LLM_BASE_URL/LLM_API_KEY.")
-    payload = json.dumps({
-        "model": os.environ.get("LLM_MODEL", "grok-4"),
-        "messages": [{"role": "system", "content": SYSTEM},
-                     {"role": "user", "content": json.dumps(questions)}],
-        "temperature": 0.2, "max_tokens": 1500,
-    }).encode()
-    req = urllib.request.Request(f"{base_url.rstrip('/')}/chat/completions", data=payload)
-    req.add_header("Authorization", f"Bearer {key}")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=90) as r:
-        raw = json.loads(r.read())["choices"][0]["message"]["content"].strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw.split("\n", 1)[1] if "\n" in raw else raw
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw)
+    """Raises llm_client.LLMError on failure — callers (poc_digest.py's
+    fetch_weekly_topics, and main() below) already catch this, so it stays a
+    plain exception rather than sys.exit()ing the whole process."""
+    raw = llm_client.chat(SYSTEM, json.dumps(questions), max_tokens=1500, temperature=0.2)
+    return json.loads(llm_client.strip_code_fence(raw))
 
 
 def main() -> int:
@@ -122,6 +107,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except RedashError as e:
+    except (RedashError, llm_client.LLMError) as e:
         print(f"\n✗ {e}", file=sys.stderr)
         raise SystemExit(1)

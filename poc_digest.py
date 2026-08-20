@@ -23,7 +23,12 @@ Run:
   export Q_QUESTIONS=1999                     # optional: questions_sample_wizjoin id (weekly topics)
   export Q_TODAY_QUESTIONS=2001               # optional: questions_today_wizjoin id (pick-3 section)
   export EXCLUDE_TENANTS=none                 # or a tenant_id, matches the Redash dropdown
-  export LLM_BASE_URL=https://api.x.ai/v1 LLM_API_KEY=xai-... LLM_MODEL=grok-4
+
+  # LLM — pick ONE of the two (see llm_client.py):
+  export ANTHROPIC_API_KEY=sk-ant-...         # direct Anthropic; ANTHROPIC_MODEL defaults to Haiku 4.5
+  #   or:
+  export LLM_BASE_URL=https://api.x.ai/v1 LLM_API_KEY=xai-... LLM_MODEL=grok-4  # OpenAI-compatible
+
   export SLACK_BOT_TOKEN=xoxb-... SLACK_CHANNEL=#your-test-channel
   python3 poc_digest.py --dry-run          # print, don't post
   python3 poc_digest.py --date 2026-08-19  # post for real
@@ -43,6 +48,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)                                   # redash_client, slack (local copy)
 from redash_client import Redash, RedashError  # noqa: E402
 from find_recurring_topics import cluster as cluster_topics  # noqa: E402
+import llm_client  # noqa: E402
 
 
 def load_dotenv(path: str) -> int:
@@ -252,28 +258,12 @@ def pick_interesting_questions(rows: list[dict]) -> list[dict]:
     substantive vs. routine), not a numeric score, and not something SQL can
     do since "interesting" isn't a column.
     """
-    base_url, key = os.environ.get("LLM_BASE_URL"), os.environ.get("LLM_API_KEY")
-    if not base_url or not key or not rows:
+    if not rows:
         return []
     sample = [{"question": r["question"], "tenant": r.get("tenant", "")} for r in rows]
     try:
-        payload = json.dumps({
-            "model": os.environ.get("LLM_MODEL", "grok-4"),
-            "messages": [{"role": "system", "content": _PICK3_SYSTEM},
-                         {"role": "user", "content": json.dumps(sample)}],
-            "temperature": 0.2, "max_tokens": 800,
-        }).encode()
-        req = urllib.request.Request(f"{base_url.rstrip('/')}/chat/completions", data=payload)
-        req.add_header("Authorization", f"Bearer {key}")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=60) as r:
-            raw = json.loads(r.read())["choices"][0]["message"]["content"].strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            raw = raw.split("\n", 1)[1] if "\n" in raw else raw
-            if raw.startswith("json"):
-                raw = raw[4:]
-        picks = json.loads(raw).get("picks", [])
+        raw = llm_client.chat(_PICK3_SYSTEM, json.dumps(sample), max_tokens=800, temperature=0.2)
+        picks = json.loads(llm_client.strip_code_fence(raw)).get("picks", [])
     except Exception as e:  # noqa: BLE001 - this section is a bonus, never fatal
         print(f"  ! pick-3 questions failed ({e}); skipping section", file=sys.stderr)
         return []
@@ -304,10 +294,10 @@ def interesting_questions_block(picks: list[dict]) -> dict | None:
 def summarize(metrics: dict) -> dict:
     """Ask the LLM for prose. Never lets it compute a number; falls back on failure.
 
-    Provider-agnostic: any OpenAI-compatible /chat/completions endpoint works
-    (xAI Grok, a LiteLLM proxy, OpenAI itself). Set LLM_BASE_URL accordingly.
+    Provider-agnostic via llm_client.chat() — set either ANTHROPIC_API_KEY
+    (direct Anthropic) or LLM_BASE_URL+LLM_API_KEY (OpenAI-compatible: xAI
+    Grok, a LiteLLM proxy, OpenAI itself).
     """
-    base_url, key = os.environ.get("LLM_BASE_URL"), os.environ.get("LLM_API_KEY")
     system = (
         "You are a product analyst writing a daily usage digest for WizPilot. You are given "
         "PRE-COMPUTED metrics for one day, with TWO baselines: `comparison` (same weekday "
@@ -320,26 +310,9 @@ def summarize(metrics: dict) -> dict:
         '"insights": array of 2-3 short strings}. '
         "If a comparison field is null, say the baseline is unavailable rather than guessing."
     )
-    if not base_url or not key:
-        return _fallback(metrics, "LLM_BASE_URL/LLM_API_KEY not set")
     try:
-        payload = json.dumps({
-            "model": os.environ.get("LLM_MODEL", "grok-4"),
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": json.dumps(metrics, default=str)}],
-            "temperature": 0.3, "max_tokens": 500,
-        }).encode()
-        req = urllib.request.Request(f"{base_url.rstrip('/')}/chat/completions", data=payload)
-        req.add_header("Authorization", f"Bearer {key}")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=60) as r:
-            raw = json.loads(r.read())["choices"][0]["message"]["content"].strip()
-        if raw.startswith("```"):                      # tolerate code fences
-            raw = raw.strip("`")
-            raw = raw.split("\n", 1)[1] if "\n" in raw else raw
-            if raw.startswith("json"):
-                raw = raw[4:]
-        data = json.loads(raw)
+        raw = llm_client.chat(system, json.dumps(metrics, default=str), max_tokens=500, temperature=0.3)
+        data = json.loads(llm_client.strip_code_fence(raw))
         assert {"headline", "narrative", "insights"} <= data.keys()
         return data
     except Exception as e:  # noqa: BLE001 - digest must survive a bad LLM turn
@@ -369,6 +342,7 @@ def main() -> int:
     loaded = load_dotenv(args.env_file)
     if loaded:
         print(f"→ loaded {loaded} vars from {args.env_file}")
+    print(f"→ LLM provider: {llm_client.active_provider()}")
 
     import slack  # local copy — see poc/slack.py header for why it's duplicated
 
