@@ -1,0 +1,5 @@
+# poc_digest.py, redash_client.py, find_recurring_topics.py, and slack.py
+# are all stdlib-only (verified: parsed every import in poc_digest.py — none
+# are third-party). This file is intentionally empty so `pip install -r
+# requirements.txt` is a no-op on Railway; it exists only so build systems
+# that expect a requirements.txt to be present don't error.
