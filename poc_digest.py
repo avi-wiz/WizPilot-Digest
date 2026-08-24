@@ -103,6 +103,27 @@ def _one(rows: list[dict], what: str) -> dict:
     return rows[0]
 
 
+def _name(row: dict, key: str, placeholder: str, what: str) -> str:
+    """Resolve a name column, distinguishing the two ways it can be absent.
+
+    A MISSING KEY means the deployed Redash query doesn't emit that column at
+    all — i.e. it has drifted behind the .sql file in this repo. That is a bug
+    and it used to fail silently: the `or "Unknown ..."` fallback turned a
+    schema mismatch into plausible-looking Slack output ("Unknown user @
+    Unknown tenant") that nobody could distinguish from real unresolvable data.
+    Shout about it on stderr so the next drift is visible.
+
+    A PRESENT-BUT-NULL value is the case the placeholder was actually written
+    for — the id genuinely didn't resolve in query_1954/query_1915. Stays quiet.
+    """
+    if key not in row:
+        print(f"  ! {key} missing from the {what} query result — the deployed Redash "
+              f"query is out of date with the local .sql file; showing {placeholder!r}",
+              file=sys.stderr)
+        return placeholder
+    return row[key] or placeholder
+
+
 def extract(rd: Redash, target: str, exclude: str) -> dict:
     """Pull metrics + leaderboards via the Wiz Join Redash queries.
 
@@ -159,16 +180,16 @@ def extract(rd: Redash, target: str, exclude: str) -> dict:
         base_dod = {}
 
     m["report_date"] = target
-    m["top_thread_tenant_name"] = m.get("top_thread_tenant_name") or "Unknown tenant"
-    m["top_thread_user_name"] = m.get("top_thread_user_name") or "Unknown user"
+    m["top_thread_tenant_name"] = _name(m, "top_thread_tenant_name", "Unknown tenant", "metrics")
+    m["top_thread_user_name"] = _name(m, "top_thread_user_name", "Unknown user", "metrics")
     m["top_tenants"] = [
-        {"name": t.get("name") or "Unknown tenant",
+        {"name": _name(t, "name", "Unknown tenant", "leaderboards"),
          "messages": t["messages"], "distinct_users": t["distinct_users"]}
         for t in tenants
     ]
     m["top_users"] = [
-        {"name": u.get("name") or "Unknown user",
-         "tenant_name": u.get("tenant_id_ref") or "Unknown tenant",
+        {"name": _name(u, "name", "Unknown user", "leaderboards"),
+         "tenant_name": _name(u, "tenant_id_ref", "Unknown tenant", "leaderboards"),
          "messages": u["messages"]}
         for u in users
     ]
