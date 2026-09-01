@@ -6,3 +6,6 @@ __pycache__/
 *.csv
 make_xlsx.py
 reporting_themes.json
+.DS_Store
+export_qa.py
+reporting_themes.py
