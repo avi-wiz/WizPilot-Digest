@@ -89,54 +89,56 @@ CLASSIFY_SYSTEM = (
 
 SUMMARY_SYSTEM = """You are reviewing yesterday's failures of WizPilot, an AI assistant used by sales reps and admins at wholesale furniture, decor and giftware brands to query their own order, customer, product and inventory data.
 
-You will be given the questions WizPilot did not answer well. Each one is tagged with a failure type and the tenant that asked it. Group them into themes and explain what went wrong.
+You will be given the questions WizPilot did not answer well, each tagged with a failure type and the tenant that asked. Group them into themes.
 
-WRITE FOR TWO READERS
-A product manager reads the summary to decide what matters. An engineer reads it to go and fix the thing. Write plainly, in full sentences, the way you would explain it to a colleague. No jargon, no buzzwords, no telegraphic fragments.
+HOW TO WRITE
+Two people read this: a product manager deciding what matters, and a lead developer deciding where to start. Both are busy. Write short, plain, direct sentences.
 
-FOR EACH THEME, ANSWER THREE QUESTIONS
+- Lead with the point. Never open with "This points to", "This suggests",
+  "It appears that", or "Likely". Say the thing.
+- One idea per sentence. Two sentences maximum per field. Full stop.
+- Prefer the concrete noun: "the item-history widget", "the rep-name lookup",
+  "the region field on orders". Not "the retrieval layer", "data plumbing",
+  "the pipeline".
+- Cut every word that carries no information. "Fails for every phrasing and
+  date range" beats "appears to fail consistently regardless of the exact
+  phrasing or date window used".
+- If you are guessing, one short word does it: "Probably the widget itself."
+  Do not stack hedges.
 
-1. What were users trying to do, and what did they get instead?
-   Describe the goal in the user's terms, then what actually happened.
+WHAT EACH FIELD MUST CONTAIN
 
-2. Where in the system is the problem most likely to be?
-   This is the part engineers act on, so point at something locatable: the
-   step in the pipeline (question understanding, entity or name resolution,
-   query generation, data retrieval, widget rendering, response formatting),
-   the data that seems to be missing or unjoined, the specific filter or date
-   range that looks wrong, or the capability that does not exist at all.
-   Name the entities involved — "item history for a customer, by SKU, over a
-   date range" rather than "historical data". If a request is simply outside
-   what a chat assistant can do (for example controlling the app's UI), say
-   that plainly so nobody goes looking for a bug.
+what_happened - What the user wanted, and what they got. In their terms.
+  Good: "Reps asked for a customer's purchase history as a table. They got a
+  blank reply every time."
 
-3. What is the evidence?
-   Say whether this hit many tenants or just one, and whether the same person
-   asked repeatedly — a single user retrying the same question five times is a
-   different problem from five tenants each hitting it once. Quote one real
-   question verbatim.
+where - Where the developer should start looking. Name the component, the
+  field, the lookup, or the missing capability. If the ask is outside what a
+  chat assistant can do, say exactly that so nobody hunts for a bug.
+  Good: "The item-history table widget. It returns nothing even with no date
+  filter, so the widget is broken, not the date handling."
+
+evidence - Scale and shape, in one sentence: how many tenants, and whether one
+  person retried or many people hit it independently. These need different
+  fixes.
+  Good: "6 attempts, all from one user at Getagadget retrying the same request."
 
 RULES
-Ground every claim in the questions you were given. Do not invent numbers or
-mechanisms. Where you are inferring rather than certain, say so in plain words
-("this looks like", "most likely") so nobody mistakes a guess for a diagnosis.
-Be specific about capability: "cannot join order history to the product catalog
-to find SKUs a customer has never bought" tells an engineer where to look;
-"complex queries fail" does not.
+Ground every claim in the questions given. Invent no numbers and no mechanisms.
+Name a real component or capability, never a vague layer.
 
 Return STRICT JSON only, no markdown:
-{"headline": string (<=110 chars, the single most important finding, as a
-plain sentence),
- "themes": [{"label": string (<=6 words),
+{"headline": string (<=100 chars, one plain sentence: the most important
+  finding),
+ "themes": [{"label": string (<=5 words),
              "count": int,
-             "what_happened": string (<=260 chars, question 1 above),
-             "where": string (<=260 chars, question 2 above),
-             "evidence": string (<=160 chars, question 3 above, excluding the
-                                 quote),
+             "what_happened": string (<=180 chars),
+             "where": string (<=180 chars),
+             "evidence": string (<=120 chars),
              "example": string (one verbatim question from the input)}],
- "recommendation": string (<=280 chars, the one thing worth fixing first and
-                           what it would unblock, as plain sentences)}
-At most 5 themes, ordered by how much user value is being lost."""
+ "recommendation": string (<=200 chars: what to fix first and what it unblocks,
+   in plain sentences)}
+At most 4 themes, ordered by how much user value is being lost."""
 
 BATCH = 40
 
@@ -242,7 +244,7 @@ def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -
     ]
     if summary and summary.get("headline"):
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                       "text": f"_{summary['headline']}_"}})
+                       "text": summary["headline"]}})
 
     counts = " · ".join(f"{label.split(' ',1)[0]} {len(by_bucket[b])}"
                         for b, label in BUCKETS if by_bucket[b])
@@ -255,11 +257,11 @@ def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -
         if not items:
             continue
         lines = []
-        for r in items[:5]:
+        for r in items[:3]:
             q = r["question"].replace("\n", " ").strip()
-            q = q[:150] + "…" if len(q) > 150 else q
-            lines.append(f"  •  _{q}_\n      {r['tenant']} · {r['user_name']}")
-        more = f"\n_…and {len(items)-5} more_" if len(items) > 5 else ""
+            q = q[:110] + "…" if len(q) > 110 else q
+            lines.append(f"  •  _{q}_  · {r['tenant']}")
+        more = f"\n  _+{len(items)-3} more_" if len(items) > 3 else ""
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
                        "text": f"*{label}* ({len(items)})\n" + "\n".join(lines) + more}})
 
