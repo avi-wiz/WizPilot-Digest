@@ -87,40 +87,56 @@ CLASSIFY_SYSTEM = (
     "One entry for EVERY id."
 )
 
-SUMMARY_SYSTEM = (
-    "You are a product analyst reviewing failures of WizPilot, an AI assistant "
-    "for B2B wholesale commerce (sales reps and admins at furniture/decor/"
-    "giftware brands querying their own order, customer, product and inventory "
-    "data). You are given yesterday's questions that the assistant did NOT "
-    "answer well, each tagged with a failure type and the tenant that asked.\n"
-    "\nWrite an analysis a product manager can act on in a standup. For each "
-    "theme, do not just name the topic — explain the CAPABILITY GAP behind it: "
-    "what the user was trying to accomplish, what specifically the assistant "
-    "couldn't do, and why that likely happened (missing data join, unsupported "
-    "aggregation, out-of-scope request, ambiguous phrasing the assistant "
-    "couldn't resolve, a UI/navigation request the chat surface can't perform, "
-    "etc.). Distinguish a REAL capability gap from a user asking for something "
-    "genuinely out of scope — say which it is.\n"
-    "\nAlso note, where the evidence supports it: whether a theme is "
-    "concentrated in one tenant or user (which suggests a workflow or "
-    "onboarding problem rather than a product gap), and whether the same user "
-    "retried the same question (a strong signal of user frustration).\n"
-    "\nBe concrete and specific about capability: 'cannot join order history "
-    "to product catalog to find never-purchased SKUs', not 'complex queries'. "
-    "Ground every claim in the questions you were given. Do not invent numbers, "
-    "and do not speculate beyond what the questions show — if a cause is "
-    "uncertain, say so.\n"
-    "\nReturn STRICT JSON only, no markdown: "
-    '{"headline": string (<=100 chars, the single most important finding), '
-    '"themes": [{"label": string (<=6 words), "count": int, '
-    '"gap": string (<=220 chars: what users wanted and what specifically '
-    'failed), "why": string (<=200 chars: most likely underlying cause), '
-    '"evidence": string (<=120 chars: concentration/repetition if notable, '
-    'else empty string), "example": string (verbatim question from the input)}], '
-    '"recommendation": string (<=260 chars: the one capability worth building '
-    'or fixing first, and what it would unblock)}. At most 5 themes, ordered '
-    "by how much user value is being lost."
-)
+SUMMARY_SYSTEM = """You are reviewing yesterday's failures of WizPilot, an AI assistant used by sales reps and admins at wholesale furniture, decor and giftware brands to query their own order, customer, product and inventory data.
+
+You will be given the questions WizPilot did not answer well. Each one is tagged with a failure type and the tenant that asked it. Group them into themes and explain what went wrong.
+
+WRITE FOR TWO READERS
+A product manager reads the summary to decide what matters. An engineer reads it to go and fix the thing. Write plainly, in full sentences, the way you would explain it to a colleague. No jargon, no buzzwords, no telegraphic fragments.
+
+FOR EACH THEME, ANSWER THREE QUESTIONS
+
+1. What were users trying to do, and what did they get instead?
+   Describe the goal in the user's terms, then what actually happened.
+
+2. Where in the system is the problem most likely to be?
+   This is the part engineers act on, so point at something locatable: the
+   step in the pipeline (question understanding, entity or name resolution,
+   query generation, data retrieval, widget rendering, response formatting),
+   the data that seems to be missing or unjoined, the specific filter or date
+   range that looks wrong, or the capability that does not exist at all.
+   Name the entities involved — "item history for a customer, by SKU, over a
+   date range" rather than "historical data". If a request is simply outside
+   what a chat assistant can do (for example controlling the app's UI), say
+   that plainly so nobody goes looking for a bug.
+
+3. What is the evidence?
+   Say whether this hit many tenants or just one, and whether the same person
+   asked repeatedly — a single user retrying the same question five times is a
+   different problem from five tenants each hitting it once. Quote one real
+   question verbatim.
+
+RULES
+Ground every claim in the questions you were given. Do not invent numbers or
+mechanisms. Where you are inferring rather than certain, say so in plain words
+("this looks like", "most likely") so nobody mistakes a guess for a diagnosis.
+Be specific about capability: "cannot join order history to the product catalog
+to find SKUs a customer has never bought" tells an engineer where to look;
+"complex queries fail" does not.
+
+Return STRICT JSON only, no markdown:
+{"headline": string (<=110 chars, the single most important finding, as a
+plain sentence),
+ "themes": [{"label": string (<=6 words),
+             "count": int,
+             "what_happened": string (<=260 chars, question 1 above),
+             "where": string (<=260 chars, question 2 above),
+             "evidence": string (<=160 chars, question 3 above, excluding the
+                                 quote),
+             "example": string (one verbatim question from the input)}],
+ "recommendation": string (<=280 chars, the one thing worth fixing first and
+                           what it would unblock, as plain sentences)}
+At most 5 themes, ordered by how much user value is being lost."""
 
 BATCH = 40
 
@@ -241,8 +257,8 @@ def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -
         lines = []
         for r in items[:5]:
             q = r["question"].replace("\n", " ").strip()
-            q = q[:160] + "…" if len(q) > 160 else q
-            lines.append(f"• _{q}_\n   ↳ {r['tenant']} · {r['user_name']}")
+            q = q[:150] + "…" if len(q) > 150 else q
+            lines.append(f"  •  _{q}_\n      {r['tenant']} · {r['user_name']}")
         more = f"\n_…and {len(items)-5} more_" if len(items) > 5 else ""
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
                        "text": f"*{label}* ({len(items)})\n" + "\n".join(lines) + more}})
@@ -262,16 +278,18 @@ def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -
         # string once there are 5 themes.
         for n, t in enumerate(summary["themes"][:5], 1):
             parts = [f"*{n}. {t.get('label','?')}*  ·  {t.get('count','?')} question(s)"]
-            if t.get("gap"):
-                parts.append(t["gap"])
-            if t.get("why"):
-                parts.append(f"_Likely cause:_ {t['why']}")
+            # Bulleted so each answer is scannable on its own line rather than
+            # running together as a paragraph.
+            if t.get("what_happened"):
+                parts.append(f"  •  *What happened:* {t['what_happened']}")
+            if t.get("where"):
+                parts.append(f"  •  *Where to look:* {t['where']}")
             if t.get("evidence"):
-                parts.append(f"_Pattern:_ {t['evidence']}")
+                parts.append(f"  •  *Evidence:* {t['evidence']}")
             if t.get("example"):
                 ex = t["example"].replace("\n", " ").strip()
                 ex = ex[:150] + "…" if len(ex) > 150 else ex
-                parts.append(f'_e.g._ "{ex}"')
+                parts.append(f'  •  *Example:* _"{ex}"_')
             blocks.append({"type": "section", "text": {"type": "mrkdwn",
                            "text": "\n".join(parts)}})
     if summary and summary.get("recommendation"):
