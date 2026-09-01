@@ -84,14 +84,29 @@ def _chat_openai_compatible(system, user_content, max_tokens, temperature, base_
         raise LLMError(f"Unexpected OpenAI-compatible response shape: {resp}") from e
 
 
+# Newer models (Sonnet 5, Opus 5, the 4.6+ family) REMOVED the sampling
+# parameters: sending `temperature` returns
+#   400 "`temperature` is deprecated for this model."
+# Haiku 4.5 and older still accept it. Rather than hardcode a model list that
+# goes stale, send temperature only to models known to take it.
+_TEMPERATURE_OK = ("claude-haiku-4-5", "claude-3", "claude-sonnet-4-5", "claude-opus-4-5")
+
+
+def _accepts_temperature(model: str) -> bool:
+    return any(model.startswith(m) for m in _TEMPERATURE_OK)
+
+
 def _chat_anthropic(system, user_content, max_tokens, temperature, key) -> str:
-    payload = json.dumps({
-        "model": os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+    model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    body = {
+        "model": model,
         "max_tokens": max_tokens,
-        "temperature": temperature,
         "system": system,                                    # top-level, NOT a messages entry
         "messages": [{"role": "user", "content": user_content}],
-    }).encode()
+    }
+    if _accepts_temperature(model):
+        body["temperature"] = temperature
+    payload = json.dumps(body).encode()
     req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload)
     req.add_header("x-api-key", key)                          # NOT "Authorization: Bearer"
     req.add_header("anthropic-version", ANTHROPIC_VERSION)
@@ -101,10 +116,21 @@ def _chat_anthropic(system, user_content, max_tokens, temperature, key) -> str:
             resp = json.loads(r.read())
     except Exception as e:  # noqa: BLE001
         raise LLMError(f"Anthropic call failed: {e}") from e
-    try:
-        return resp["content"][0]["text"]
-    except (KeyError, IndexError) as e:
-        raise LLMError(f"Unexpected Anthropic response shape: {resp}") from e
+    # Newer models (Sonnet 5, Opus 5, ...) think by default, so content[0] is a
+    # `thinking` block and content[0]["text"] raises KeyError. Take the first
+    # TEXT block instead of assuming a position.
+    blocks = resp.get("content") or []
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+    if text:
+        return text
+    # No text at all: almost always the whole max_tokens budget went to
+    # thinking. Say that plainly instead of dumping the raw (huge) response.
+    if resp.get("stop_reason") == "max_tokens":
+        raise LLMError(
+            f"{resp.get('model','model')} hit max_tokens before writing any text "
+            f"(thinking used {resp.get('usage',{}).get('output_tokens','?')} tokens). "
+            "Raise max_tokens for this call.")
+    raise LLMError(f"Unexpected Anthropic response shape: {str(resp)[:300]}")
 
 
 def strip_code_fence(raw: str) -> str:

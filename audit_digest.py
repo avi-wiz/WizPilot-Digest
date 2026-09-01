@@ -89,16 +89,37 @@ CLASSIFY_SYSTEM = (
 
 SUMMARY_SYSTEM = (
     "You are a product analyst reviewing failures of WizPilot, an AI assistant "
-    "for wholesale commerce. You are given user questions that the assistant "
-    "did NOT answer well, already grouped by failure type. Identify the "
-    "recurring THEMES in what users wanted but didn't get — cluster by the "
-    "underlying capability gap, not by wording. Be concrete and specific about "
-    "capability, e.g. 'multi-step margin/profitability analysis' rather than "
-    "'complex queries'. Do not invent numbers. Return STRICT JSON only: "
-    '{"headline": string (<=90 chars, the single biggest gap), '
-    '"themes": [{"label": string (<=6 words), "count": int, "example": string '
-    '(verbatim from the input)}], "recommendation": string (<=180 chars, the '
-    'one capability worth building or fixing first)}. At most 5 themes.'
+    "for B2B wholesale commerce (sales reps and admins at furniture/decor/"
+    "giftware brands querying their own order, customer, product and inventory "
+    "data). You are given yesterday's questions that the assistant did NOT "
+    "answer well, each tagged with a failure type and the tenant that asked.\n"
+    "\nWrite an analysis a product manager can act on in a standup. For each "
+    "theme, do not just name the topic — explain the CAPABILITY GAP behind it: "
+    "what the user was trying to accomplish, what specifically the assistant "
+    "couldn't do, and why that likely happened (missing data join, unsupported "
+    "aggregation, out-of-scope request, ambiguous phrasing the assistant "
+    "couldn't resolve, a UI/navigation request the chat surface can't perform, "
+    "etc.). Distinguish a REAL capability gap from a user asking for something "
+    "genuinely out of scope — say which it is.\n"
+    "\nAlso note, where the evidence supports it: whether a theme is "
+    "concentrated in one tenant or user (which suggests a workflow or "
+    "onboarding problem rather than a product gap), and whether the same user "
+    "retried the same question (a strong signal of user frustration).\n"
+    "\nBe concrete and specific about capability: 'cannot join order history "
+    "to product catalog to find never-purchased SKUs', not 'complex queries'. "
+    "Ground every claim in the questions you were given. Do not invent numbers, "
+    "and do not speculate beyond what the questions show — if a cause is "
+    "uncertain, say so.\n"
+    "\nReturn STRICT JSON only, no markdown: "
+    '{"headline": string (<=100 chars, the single most important finding), '
+    '"themes": [{"label": string (<=6 words), "count": int, '
+    '"gap": string (<=220 chars: what users wanted and what specifically '
+    'failed), "why": string (<=200 chars: most likely underlying cause), '
+    '"evidence": string (<=120 chars: concentration/repetition if notable, '
+    'else empty string), "example": string (verbatim question from the input)}], '
+    '"recommendation": string (<=260 chars: the one capability worth building '
+    'or fixing first, and what it would unblock)}. At most 5 themes, ordered '
+    "by how much user value is being lost."
 )
 
 BATCH = 40
@@ -161,7 +182,7 @@ def classify_ambiguous(rows: list[dict]) -> None:
                    for n, r in enumerate(chunk)]
         try:
             raw = llm_client.chat(CLASSIFY_SYSTEM, json.dumps(payload, ensure_ascii=False),
-                                  max_tokens=3000, temperature=0)
+                                  max_tokens=8000, temperature=0)
             by_i = {int(l["i"]): l.get("verdict")
                     for l in _json_obj(raw)["labels"]}
             for n, r in enumerate(chunk):
@@ -181,7 +202,7 @@ def summarize(failures: list[dict]) -> dict | None:
     payload = [{"bucket": r["bucket"], "question": r["question"]} for r in failures]
     try:
         raw = llm_client.chat(SUMMARY_SYSTEM, json.dumps(payload, ensure_ascii=False),
-                              max_tokens=1200, temperature=0.2)
+                              max_tokens=6000, temperature=0.2)
         d = _json_obj(raw)
         assert "headline" in d and "themes" in d
         return d
@@ -233,14 +254,30 @@ def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -
                                "run or failed; these need a manual look."}})
 
     if summary and summary.get("themes"):
-        lines = [f"{i}. *{t['label']}* — {t.get('count','?')}"
-                 for i, t in enumerate(summary["themes"][:5], 1)]
         blocks.append({"type": "divider"})
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                       "text": "*Recurring gaps*\n" + "\n".join(lines)}})
+                       "text": "*What's actually breaking*"}})
+        # One block per theme: Slack truncates a section at 3000 chars, and the
+        # detailed gap/why/evidence fields would blow that as a single joined
+        # string once there are 5 themes.
+        for n, t in enumerate(summary["themes"][:5], 1):
+            parts = [f"*{n}. {t.get('label','?')}*  ·  {t.get('count','?')} question(s)"]
+            if t.get("gap"):
+                parts.append(t["gap"])
+            if t.get("why"):
+                parts.append(f"_Likely cause:_ {t['why']}")
+            if t.get("evidence"):
+                parts.append(f"_Pattern:_ {t['evidence']}")
+            if t.get("example"):
+                ex = t["example"].replace("\n", " ").strip()
+                ex = ex[:150] + "…" if len(ex) > 150 else ex
+                parts.append(f'_e.g._ "{ex}"')
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                           "text": "\n".join(parts)}})
     if summary and summary.get("recommendation"):
+        blocks.append({"type": "divider"})
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                       "text": f"*Worth fixing first:* {summary['recommendation']}"}})
+                       "text": f"*Worth fixing first*\n{summary['recommendation']}"}})
 
     blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
                    "text": "Excludes internal users and demo tenants. "

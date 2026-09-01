@@ -61,6 +61,22 @@ The audit reads `AUDIT_SLACK_*` only and never falls back to `SLACK_BOT_TOKEN`,
 so a misconfigured audit stays silent rather than posting into the digest
 channel.
 
+## Model
+
+Set `ANTHROPIC_MODEL=claude-sonnet-5`. The insight quality difference over
+Haiku is large — Sonnet reasons about *why* a gap exists and separates a real
+capability gap from a genuinely out-of-scope request. Roughly 2x the input
+cost ($2/$10 per 1M vs $1/$5), on a handful of calls a day.
+
+Two things this model family changes, both handled in `llm_client.py`:
+
+- **`temperature` is rejected** (400 `temperature is deprecated for this
+  model`). It's now sent only to models known to accept it.
+- **Thinking is on by default**, so the reply's first content block is a
+  `thinking` block, not text — the client takes the first *text* block rather
+  than `content[0]`, and `max_tokens` is set high enough that thinking doesn't
+  consume the whole budget before any answer is written.
+
 ## Notes
 
 - Responses are truncated at 1500 chars upstream, so the LLM judges a partial
