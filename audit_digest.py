@@ -36,6 +36,7 @@ sys.path.insert(0, _HERE)
 from redash_client import Redash, RedashError   # noqa: E402
 from poc_digest import load_dotenv, _env, _qid  # noqa: E402
 from audit_client import triage                 # noqa: E402
+from capabilities import CAPABILITIES            # noqa: E402
 import llm_client                               # noqa: E402
 
 # Human-facing labels + the order sections appear in Slack. Ordered by how
@@ -67,6 +68,41 @@ WHERE date(datetime(a.asked_at, '+5 hours', '+30 minutes')) = '{day}'
 ORDER BY a.asked_at
 """
 
+# Response time. thread_messages is only visible on the Postgres source that
+# query_1953 reads, not through the Wiz Join view, so this runs separately.
+# Latency = last assistant message of a turn minus the user message. Internal
+# users are excluded so the numbers line up with the audited turns.
+LATENCY_SQL = """
+WITH turns AS (
+  SELECT
+    tm.created_at AS asked,
+    (SELECT max(r.created_at) FROM thread_messages r
+      WHERE r.thread_id = tm.thread_id AND r.role = 'assistant'
+        AND r.ordinal > tm.ordinal
+        AND r.ordinal < COALESCE((SELECT min(u.ordinal) FROM thread_messages u
+              WHERE u.thread_id = tm.thread_id AND u.role = 'user'
+                AND u.ordinal > tm.ordinal), 2147483647)) AS answered
+  FROM thread_messages tm
+  JOIN threads t ON t.id = tm.thread_id
+  WHERE tm.role = 'user'
+    AND t.platform = 'wizorder'
+    AND (tm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date = DATE '{day}'
+    AND COALESCE(tm.request_meta->'session'->>'user_name', '') <> 'Internal'
+)
+SELECT
+  COUNT(*)                                                          AS turns,
+  COUNT(answered)                                                   AS answered,
+  ROUND(AVG(EXTRACT(EPOCH FROM (answered - asked)))::numeric, 0)    AS avg_s,
+  ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+      ORDER BY EXTRACT(EPOCH FROM (answered - asked)))::numeric, 0) AS p50_s,
+  ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (
+      ORDER BY EXTRACT(EPOCH FROM (answered - asked)))::numeric, 0) AS p95_s,
+  ROUND(MAX(EXTRACT(EPOCH FROM (answered - asked)))::numeric, 0)    AS max_s,
+  COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM (answered - asked)) > 120) AS over_2min
+FROM turns
+"""
+
+
 CLASSIFY_SYSTEM = (
     "You audit an AI assistant for a B2B wholesale commerce platform. Each item "
     "is a user question and the assistant's reply. The reply may contain the "
@@ -96,49 +132,59 @@ Two people read this: a product manager deciding what matters, and a lead develo
 
 - Lead with the point. Never open with "This points to", "This suggests",
   "It appears that", or "Likely". Say the thing.
-- One idea per sentence. Two sentences maximum per field. Full stop.
-- Prefer the concrete noun: "the item-history widget", "the rep-name lookup",
-  "the region field on orders". Not "the retrieval layer", "data plumbing",
-  "the pipeline".
-- Cut every word that carries no information. "Fails for every phrasing and
-  date range" beats "appears to fail consistently regardless of the exact
-  phrasing or date window used".
+- One idea per sentence. Two sentences maximum per field.
+- Prefer the concrete noun: "the item-history widget", "the rep-name lookup".
+  Not "the retrieval layer" or "data plumbing".
+- Cut every word that carries no information.
 - If you are guessing, one short word does it: "Probably the widget itself."
-  Do not stack hedges.
+
+CLASSIFY EACH THEME (the `verdict` field) — this is the most important call
+you make, because it decides who picks the work up:
+
+  SHIPPED_BUT_BROKEN - The capability is on the SHIPPED CAPABILITIES list
+    below, but it failed anyway. This is a bug or regression. Put the matching
+    capability ID(s) in `capability`, e.g. "US-04" or "Data Table".
+  WRONG_ANSWER - It answered, but the answer is not usable: it contradicts
+    itself, ignores a filter the user asked for, returns something unrelated
+    to the question, or asks the user a question they had already answered.
+  NOT_SUPPORTED - No capability on the list covers this. It is a roadmap gap.
+    Leave `capability` empty.
+  OUT_OF_SCOPE - Not something a chat assistant can do at all (controlling the
+    app UI, closing a page). Nobody should hunt for a bug. `capability` empty.
+
+Be strict about SHIPPED_BUT_BROKEN. Only use it when the question plainly falls
+inside a listed capability. If it is a near miss, use NOT_SUPPORTED and say in
+`where` which capability it is adjacent to.
 
 WHAT EACH FIELD MUST CONTAIN
 
-what_happened - What the user wanted, and what they got. In their terms.
-  Good: "Reps asked for a customer's purchase history as a table. They got a
-  blank reply every time."
-
-where - Where the developer should start looking. Name the component, the
-  field, the lookup, or the missing capability. If the ask is outside what a
-  chat assistant can do, say exactly that so nobody hunts for a bug.
-  Good: "The item-history table widget. It returns nothing even with no date
-  filter, so the widget is broken, not the date handling."
-
-evidence - Scale and shape, in one sentence: how many tenants, and whether one
-  person retried or many people hit it independently. These need different
-  fixes.
-  Good: "6 attempts, all from one user at Getagadget retrying the same request."
+what_happened - What the user wanted and what they got, in their terms.
+where - Where the developer should start. Name the component, field, lookup,
+  or the missing capability.
+evidence - Scale and shape in one sentence: how many tenants, and whether one
+  person retried or many people hit it independently.
 
 RULES
 Ground every claim in the questions given. Invent no numbers and no mechanisms.
-Name a real component or capability, never a vague layer.
+
+SHIPPED CAPABILITIES (already live — a failure here is a bug, not a gap):
+{capabilities}
 
 Return STRICT JSON only, no markdown:
-{"headline": string (<=100 chars, one plain sentence: the most important
+{{"headline": string (<=100 chars, one plain sentence: the most important
   finding),
- "themes": [{"label": string (<=5 words),
+ "themes": [{{"label": string (<=5 words),
              "count": int,
+             "verdict": "SHIPPED_BUT_BROKEN" | "WRONG_ANSWER" |
+                        "NOT_SUPPORTED" | "OUT_OF_SCOPE",
+             "capability": string (matching ID(s) from the list, or ""),
              "what_happened": string (<=180 chars),
              "where": string (<=180 chars),
              "evidence": string (<=120 chars),
-             "example": string (one verbatim question from the input)}],
- "recommendation": string (<=200 chars: what to fix first and what it unblocks,
-   in plain sentences)}
-At most 4 themes, ordered by how much user value is being lost."""
+             "example": string (one verbatim question from the input)}}],
+ "recommendation": string (<=200 chars: what to fix first and what it unblocks)
+}}
+At most 5 themes, ordered by how much user value is being lost."""
 
 BATCH = 40
 
@@ -217,10 +263,12 @@ def summarize(failures: list[dict]) -> dict | None:
     sends its counts and examples without this section."""
     if not failures:
         return None
-    payload = [{"bucket": r["bucket"], "question": r["question"]} for r in failures]
+    payload = [{"bucket": r["bucket"], "question": r["question"],
+                "tenant": r.get("tenant", "")} for r in failures]
+    system = SUMMARY_SYSTEM.format(capabilities=CAPABILITIES)
     try:
-        raw = llm_client.chat(SUMMARY_SYSTEM, json.dumps(payload, ensure_ascii=False),
-                              max_tokens=6000, temperature=0.2)
+        raw = llm_client.chat(system, json.dumps(payload, ensure_ascii=False),
+                              max_tokens=16000, temperature=0.2)
         d = _json_obj(raw)
         assert "headline" in d and "themes" in d
         return d
@@ -229,7 +277,8 @@ def summarize(failures: list[dict]) -> dict | None:
         return None
 
 
-def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -> list[dict]:
+def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None,
+                 latency: dict | None = None) -> list[dict]:
     by_bucket: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_bucket[r["bucket"]].append(r)
@@ -250,6 +299,24 @@ def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -
                         for b, label in BUCKETS if by_bucket[b])
     if counts:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": counts}]})
+
+    if latency and latency.get("p50_s") is not None:
+        def _t(sec):
+            sec = int(sec or 0)
+            return f"{sec}s" if sec < 90 else f"{sec // 60}m {sec % 60}s"
+        unanswered = int(latency.get("turns") or 0) - int(latency.get("answered") or 0)
+        line = (f"*Response time*  ·  median {_t(latency['p50_s'])}  ·  "
+                f"avg {_t(latency['avg_s'])}  ·  p95 {_t(latency['p95_s'])}  ·  "
+                f"slowest {_t(latency['max_s'])}")
+        over = int(latency.get("over_2min") or 0)
+        extra = []
+        if over:
+            extra.append(f"{over} answer(s) took over 2 min")
+        if unanswered > 0:
+            extra.append(f"{unanswered} never got a reply")
+        if extra:
+            line += "\n" + " · ".join(extra)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line}})
     blocks.append({"type": "divider"})
 
     for bucket, label in BUCKETS:
@@ -278,8 +345,21 @@ def build_blocks(day: str, total: int, rows: list[dict], summary: dict | None) -
         # One block per theme: Slack truncates a section at 3000 chars, and the
         # detailed gap/why/evidence fields would blow that as a single joined
         # string once there are 5 themes.
+        # Verdict decides who picks the work up, so it leads the theme line.
+        VERDICT = {
+            "SHIPPED_BUT_BROKEN": "🐛 Shipped but broken",
+            "WRONG_ANSWER":       "⚠️ Wrong answer",
+            "NOT_SUPPORTED":      "🧩 Not built yet",
+            "OUT_OF_SCOPE":       "🚧 Out of scope",
+        }
         for n, t in enumerate(summary["themes"][:5], 1):
-            parts = [f"*{n}. {t.get('label','?')}*  ·  {t.get('count','?')} question(s)"]
+            head = f"*{n}. {t.get('label','?')}*  ·  {t.get('count','?')} question(s)"
+            badge = VERDICT.get(t.get("verdict", ""))
+            if badge:
+                head += f"  ·  {badge}"
+            if t.get("capability"):
+                head += f"  ·  `{t['capability']}`"
+            parts = [head]
             # Bulleted so each answer is scannable on its own line rather than
             # running together as a paragraph.
             if t.get("what_happened"):
@@ -338,6 +418,17 @@ def main() -> int:
     print(f"→ auditing {day} (LLM: {llm_client.active_provider()})")
     rows = run_adhoc(rd, ds, SQL.format(day=day, exclude=exclude))
     total = len(rows)
+
+    # Latency lives on the Postgres source behind query_1953, not the Wiz Join
+    # view — a separate query. Non-fatal: the audit is still worth sending
+    # without timing numbers.
+    latency = None
+    try:
+        src_ds = rd.get_query(1953)["data_source_id"]
+        lat_rows = run_adhoc(rd, src_ds, LATENCY_SQL.format(day=day))
+        latency = lat_rows[0] if lat_rows else None
+    except Exception as e:  # noqa: BLE001
+        print(f"  ! latency query failed ({e}); sending without timings", file=sys.stderr)
     print(f"  {total} question(s)")
     if not total:
         print("  nothing to audit")
@@ -358,8 +449,12 @@ def main() -> int:
         if args.dry_run:
             return 0
 
+    if latency and latency.get("avg_s") is not None:
+        print(f"  timing: avg {latency['avg_s']}s, p50 {latency['p50_s']}s, "
+              f"p95 {latency['p95_s']}s, max {latency['max_s']}s")
+
     summary = summarize(failures)
-    blocks = build_blocks(day, total, rows, summary)
+    blocks = build_blocks(day, total, rows, summary, latency)
     text = f"WizPilot gaps — {day}: {len(failures)} of {total} questions unanswered"
 
     if args.dry_run:

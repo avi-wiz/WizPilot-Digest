@@ -61,6 +61,24 @@ The audit reads `AUDIT_SLACK_*` only and never falls back to `SLACK_BOT_TOKEN`,
 so a misconfigured audit stays silent rather than posting into the digest
 channel.
 
+## What the report covers
+
+- **Response time** - median, average, p95 and slowest, plus how many answers
+  took over 2 minutes and how many never got a reply. Computed from
+  `thread_messages` (last assistant message of a turn minus the user message),
+  not from the Wiz Join view, which has no timestamps.
+- **Not answered** - blank, refused, errored, or empty result.
+- **Questionable answers** - it replied, but the reply isn't usable (verdict
+  `WRONG_ANSWER`).
+- **Shipped but broken** - the question maps to a capability in
+  `capabilities.py` that is already live, so the failure is a bug, not a gap.
+  Tagged with the capability ID. Keep `capabilities.py` current as things ship,
+  or everything will read as "not built yet".
+
+Each theme carries one of four verdicts, which is what decides who picks it up:
+`SHIPPED_BUT_BROKEN` (bug), `WRONG_ANSWER` (quality), `NOT_SUPPORTED`
+(roadmap), `OUT_OF_SCOPE` (not a chat assistant's job).
+
 ## Model
 
 Set `ANTHROPIC_MODEL=claude-sonnet-5`. The insight quality difference over
